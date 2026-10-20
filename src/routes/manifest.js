@@ -15,7 +15,7 @@ const {
 const {
   readRck, getRemintCacheKey, remintCache, mergeRemintedUrl, isExpiryStatus, attemptRemint
 } = require('../remint');
-const { rewriteHlsUri } = require('../services/HlsRewriteService');
+const { rewriteHlsUri, rewriteTagLine } = require('../services/HlsRewriteService');
 const { safeFetch: _safeFetch } = require('../impitClient');
 const { getRequestBaseUrl } = require('../config');
 
@@ -118,17 +118,8 @@ router.get('/api/manifest', async (req, res) => {
           if (!l) return resultLine;
           
           if (l.startsWith('#')) {
-              // Handle EXT-X-MAP:URI="relative.mp4"
-              if (l.startsWith('#EXT-X-MAP:')) {
-                  const uriMatch = l.match(/URI="([^"]+)"/);
-                  if (uriMatch) {
-                      try {
-                          const absUri = new URL(uriMatch[1], effectiveUrl).toString();
-                          resultLine = l.replace(uriMatch[1], absUri);
-                      } catch(e) {}
-                  }
-              }
-              return resultLine;
+              // URI attributes on EXT-X-MAP / EXT-X-KEY / EXT-X-MEDIA etc.
+              return rewriteTagLine(line, effectiveUrl, { referer, origin, rckSuffix });
           }
 
           return rewriteHlsUri(l, effectiveUrl, { referer, origin, rckSuffix });

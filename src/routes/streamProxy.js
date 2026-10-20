@@ -374,66 +374,106 @@ function createSegmentUncloakStream() {
   });
 }
 
+const HLSCHUNK_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
+const HLSCHUNK_MAX_REDIRECTS = 4;
+const PASS_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified', 'etag'];
+
 router.get('/api/hlschunk', async (req, res) => {
   const targetUrl = req.query.url;
   const referer = req.query.referer;
   const origin = req.query.origin;
+  // raw=1: genuine media (TS / fMP4 / AAC / AES key) relayed byte-for-byte with
+  // upstream headers. Without it the uncloak transform strips fake image
+  // headers from disguised segments (the original behaviour).
+  const raw = req.query.raw === '1';
   if (!targetUrl) return res.status(400).send('Missing url');
 
-  // SSRF gate — must run before client.get() below. Marked async only for this
-  // await; the streaming path itself is untouched.
+  // SSRF gate — must run before any upstream request.
   const verdict = await checkOutboundUrl(targetUrl);
   if (!verdict.ok) return rejectBlockedUrl(res, verdict, 'HLSChunk');
 
-  try {
-    const parsed = new URL(targetUrl);
+  const headers = { 'User-Agent': HLSCHUNK_UA, 'Accept': '*/*' };
+  if (referer) headers['Referer'] = referer;
+  if (origin) headers['Origin'] = origin;
+  if (req.headers['range']) headers['Range'] = req.headers['range'];
+
+  let current = null;
+  let finished = false;
+  // res 'close' fires on client abort and after a completed response.
+  res.on('close', () => {
+    finished = true;
+    if (current && !current.destroyed) current.destroy();
+  });
+
+  const fail = (status, msg) => {
+    if (!res.headersSent) res.status(status).send(msg);
+    else res.destroy();
+  };
+
+  const request = async (url, hop) => {
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { return fail(502, 'Bad upstream URL'); }
     const isHttps = parsed.protocol === 'https:';
     const client = isHttps ? https : http;
     const agent = isHttps ? hlsChunkHttpsAgent : hlsChunkHttpAgent;
 
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
-    };
-    if (referer) headers['Referer'] = referer;
-    if (origin) headers['Origin'] = origin;
-    if (req.headers['range']) headers['Range'] = req.headers['range'];
+    current = client.get(url, { agent, headers, timeout: 15000 }, (upstreamRes) => {
+      const status = upstreamRes.statusCode || 502;
 
-    const upstreamReq = client.get(targetUrl, {
-      agent,
-      headers,
-      timeout: 15000
-    }, upstreamRes => {
-      res.status(upstreamRes.statusCode);
+      // CDNs routinely 302 a segment to an edge node. Follow it here: passing
+      // the 3xx through without a Location header left the player stranded,
+      // and handing it the edge URL would bypass the relay.
+      if (status >= 300 && status < 400 && upstreamRes.headers.location && hop < HLSCHUNK_MAX_REDIRECTS) {
+        upstreamRes.resume();
+        let next;
+        try { next = new URL(upstreamRes.headers.location, url).toString(); } catch (_) { return fail(502, 'Bad redirect'); }
+        checkOutboundUrl(next).then((v) => {
+          if (finished) return;
+          if (!v.ok) return rejectBlockedUrl(res, v, 'HLSChunk');
+          request(next, hop + 1);
+        }).catch(() => fail(502, 'Redirect check failed'));
+        return;
+      }
+
+      res.status(status);
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Content-Type', 'video/mp2t');
-
       res.setHeader('Cache-Control', 'no-store');
+      if (raw) {
+        for (const h of PASS_HEADERS) {
+          if (upstreamRes.headers[h]) res.setHeader(h, upstreamRes.headers[h]);
+        }
+        if (!upstreamRes.headers['content-type']) res.setHeader('Content-Type', 'application/octet-stream');
+      } else {
+        res.setHeader('Content-Type', 'video/mp2t');
+      }
+
+      const chain = raw ? [upstreamRes, res] : [upstreamRes, createSegmentUncloakStream(), res];
       // pipeline() instead of chained .pipe(): an upstream reset or a client
       // abort used to emit an unhandled 'error' (surfacing as
       // uncaughtException) and leave the other side of the chain open.
-      pipeline(upstreamRes, createSegmentUncloakStream(), res, (err) => {
+      pipeline(...chain, (err) => {
         if (err && !(err.code === 'ERR_STREAM_PREMATURE_CLOSE' || err.code === 'ECONNRESET' || /abort/i.test(String(err.message)))) {
           console.error('[HLSChunk] stream error:', err.message);
         }
-        if (!upstreamReq.destroyed) upstreamReq.destroy();
+        if (current && !current.destroyed) current.destroy();
       });
     });
 
-    upstreamReq.on('timeout', () => {
-      upstreamReq.destroy(new Error('Upstream timeout'));
+    current.on('timeout', () => {
+      current.destroy(new Error('Upstream timeout'));
     });
-
-    upstreamReq.on('error', err => {
+    current.on('error', (err) => {
+      if (finished) return;
       console.error('[HLSChunk] Upstream request error:', err.message);
-      if (!res.headersSent) res.status(502).send('Upstream error');
+      fail(502, 'Upstream error');
     });
+  };
 
-    req.on('close', () => {
-      if (!upstreamReq.destroyed) upstreamReq.destroy();
-    });
+  try {
+    await request(targetUrl, 0);
   } catch (e) {
     console.error('[HLSChunk] Error:', e.message);
-    if (!res.headersSent) res.status(500).send('Proxy error');
+    fail(500, 'Proxy error');
   }
 });
 
