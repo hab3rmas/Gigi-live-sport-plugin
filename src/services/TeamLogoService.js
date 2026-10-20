@@ -553,6 +553,23 @@ const CURATED_BADGES = {
   'islamabad united': 'https://r2.thesportsdb.com/images/media/team/badge/5bi3eb1709123559.png'
 };
 
+// TheSportsDB API key and per-minute request budget (free key "123" allows
+// roughly 30 requests per minute).
+const SPORTSDB_KEY = process.env.THESPORTSDB_API_KEY || '123';
+const SPORTSDB_RPM = Math.max(1, Number(process.env.THESPORTSDB_RPM) || 25);
+let _sportsDbWindowStart = 0;
+let _sportsDbCount = 0;
+function _sportsDbTakeToken() {
+  const now = Date.now();
+  if (now - _sportsDbWindowStart >= 60000) {
+    _sportsDbWindowStart = now;
+    _sportsDbCount = 0;
+  }
+  if (_sportsDbCount >= SPORTSDB_RPM) return false;
+  _sportsDbCount++;
+  return true;
+}
+
 class TeamLogoService {
   constructor() {
     this.cache = new Map(); // key -> { url, expiresAt }
@@ -803,7 +820,13 @@ class TeamLogoService {
         const queryName = TEAM_ALIASES[rawLower] || teamName;
         const cleanQuery = this._cleanName(queryName) || queryName;
 
-        const url = `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(cleanQuery)}`;
+        // The legacy free key "3" is permanently disabled upstream (every call
+        // answers 403 "use the new test key 123"), so crest lookups silently
+        // failed. Key is configurable; the free tier is rate-limited, so calls
+        // are also budgeted per minute (an over-budget lookup is simply not
+        // cached and is retried on a later render).
+        if (!_sportsDbTakeToken()) return null;
+        const url = `https://www.thesportsdb.com/api/v1/json/${encodeURIComponent(SPORTSDB_KEY)}/searchteams.php?t=${encodeURIComponent(cleanQuery)}`;
         const res = await safeFetch(url, {
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',

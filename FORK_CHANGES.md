@@ -47,6 +47,7 @@
 
 ## Прочие исправленные баги оригинала
 - PpvSt падал на каждом стриме (`chanStr is not defined`).
+- Гербы команд из TheSportsDB не грузились: старый бесплатный ключ `3` отключён (403). Ключ вынесен в `THESPORTSDB_API_KEY` (по умолчанию `123`), запросы ограничены по частоте (`THESPORTSDB_RPM`).
 
 ## Деплой
 `docker-compose.yml` (аддон + Caddy с авто-HTTPS), `deploy/Caddyfile`, `.env.example`, `DEPLOY_RU.md`.
