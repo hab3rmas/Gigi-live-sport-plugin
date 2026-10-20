@@ -618,6 +618,12 @@ app.get(['/img/match', '/:config/img/match'], async (req, res) => {
   };
 
   const badges = await resolveAll();
+  if (qs(query.cat) === 'football') {
+    try {
+      const lc = require('./services/LeagueCardService');
+      if (lc.detectCompetition(query.lg)) Object.assign(badges, await lc.teamColors(badges.badge1, badges.badge2));
+    } catch (_) { /* colours are decoration only */ }
+  }
 
   const renderCard = (b) => imageService.generateMatchCardSvg({
     category: qs(query.cat),
@@ -629,6 +635,8 @@ app.get(['/img/match', '/:config/img/match'], async (req, res) => {
     leagueBadge: b.leagueBadge,
     channelBadge: b.channelBadge,
     channelMark: b.channelMark,
+    color1: b.color1,
+    color2: b.color2,
     league: qs(query.lg),
     channel: qs(query.ch),
     status: qs(query.st),

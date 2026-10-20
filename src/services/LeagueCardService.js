@@ -87,6 +87,60 @@ function parseScore(raw) {
   return m ? `${m[1]}  –  ${m[2]}` : '';
 }
 
+
+// ── Dominant crest colour (team colours are facts, not protected artwork) ──
+let _sharp = null;
+function getSharp() { if (_sharp === null) { try { _sharp = require('sharp'); } catch (_) { _sharp = false; } } return _sharp; }
+const _colorMemo = new Map();
+
+function hex(r, g, b) { return '#' + [r, g, b].map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join(''); }
+
+async function dominantColor(dataUri) {
+  if (!dataUri || typeof dataUri !== 'string' || !dataUri.startsWith('data:')) return null;
+  if (_colorMemo.has(dataUri)) return _colorMemo.get(dataUri);
+  let out = null;
+  try {
+    const sharp = getSharp();
+    const comma = dataUri.indexOf(',');
+    const meta = dataUri.slice(5, comma);
+    const body = dataUri.slice(comma + 1);
+    const buf = /;base64/.test(meta) ? Buffer.from(body, 'base64') : Buffer.from(decodeURIComponent(body));
+    if (sharp) {
+      const { data, info } = await sharp(buf, { density: 96 }).resize(40, 40, { fit: 'inside' }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+      const buckets = new Map();
+      for (let i = 0; i < data.length; i += info.channels) {
+        const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+        if (a < 160) continue;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const sat = mx === 0 ? 0 : (mx - mn) / mx;
+        if (lum > 232 || lum < 28 || sat < 0.28) continue;      // skip white, black, grey
+        const k = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+        const e = buckets.get(k) || { n: 0, r: 0, g: 0, b: 0, sat: 0 };
+        e.n++; e.r += r; e.g += g; e.b += b; e.sat += sat; buckets.set(k, e);
+      }
+      let best = null, bestScore = 0;
+      for (const e of buckets.values()) {
+        const score = e.n * (0.5 + e.sat / e.n);
+        if (score > bestScore) { bestScore = score; best = e; }
+      }
+      if (best) out = hex(best.r / best.n, best.g / best.n, best.b / best.n);
+    }
+  } catch (_) { out = null; }
+  if (_colorMemo.size > 500) _colorMemo.clear();
+  _colorMemo.set(dataUri, out);
+  return out;
+}
+
+async function teamColors(badge1, badge2) {
+  const [c1, c2] = await Promise.all([dominantColor(badge1), dominantColor(badge2)]);
+  return { color1: c1, color2: c2 };
+}
+
+function parseHex(h) { const m = /^#([0-9a-f]{6})$/i.exec(h || ''); if (!m) return null; const n = parseInt(m[1], 16); return [n >> 16, (n >> 8) & 255, n & 255]; }
+function shade(h, f) { const c = parseHex(h); if (!c) return h; return hex(c[0] * f, c[1] * f, c[2] * f); }
+function dist(a, b) { const x = parseHex(a), y = parseHex(b); if (!x || !y) return 999; return Math.hypot(x[0] - y[0], x[1] - y[1], x[2] - y[2]); }
+
 function generateLeagueCardSvg(spec = {}) {
   if (String(process.env.MATCH_CARD_STYLE || '').toLowerCase() === 'classic') return null;
   const key = detectCompetition(spec.league);
@@ -107,8 +161,32 @@ function generateLeagueCardSvg(spec = {}) {
 
   // ── Background: theme gradient, two soft glows, diagonal light streaks ──
   parts.push(`<rect width="${w}" height="${h}" fill="url(#bg)"/>`);
-  parts.push(`<rect width="${w}" height="${h}" fill="url(#glowA)"/>`);
-  parts.push(`<rect width="${w}" height="${h}" fill="url(#glowB)"/>`);
+  // Two-team split: each side is washed with that team's crest colour, divided by
+  // a slanted seam in the competition accent. Falls back to the theme alone.
+  let c1 = spec.color1 || null;
+  let c2 = spec.color2 || null;
+  if (c1 && c2 && dist(c1, c2) < 70) c2 = th.glow;      // two near-identical kits: contrast the second
+  if (c1 || c2) {
+    const a = shade(c1 || th.glow, 0.62), b = shade(c2 || th.glow, 0.62);
+    const topPoly = isPoster
+      ? `0,0 ${w},0 ${w},${h * 0.43} 0,${h * 0.57}`
+      : `0,0 ${w * 0.57},0 ${w * 0.43},${h} 0,${h}`;
+    const botPoly = isPoster
+      ? `0,${h * 0.57} ${w},${h * 0.43} ${w},${h} 0,${h}`
+      : `${w * 0.57},0 ${w},0 ${w},${h} ${w * 0.43},${h}`;
+    const dir1 = isPoster ? 'x1="0" y1="0" x2="0" y2="1"' : 'x1="0" y1="0" x2="1" y2="0"';
+    const dir2 = isPoster ? 'x1="0" y1="1" x2="0" y2="0"' : 'x1="1" y1="0" x2="0" y2="0"';
+    spec._splitDefs = `<linearGradient id="sideA" ${dir1}><stop offset="0" stop-color="${a}" stop-opacity="0.95"/><stop offset="1" stop-color="${a}" stop-opacity="0.45"/></linearGradient>` +
+      `<linearGradient id="sideB" ${dir2}><stop offset="0" stop-color="${b}" stop-opacity="0.95"/><stop offset="1" stop-color="${b}" stop-opacity="0.45"/></linearGradient>`;
+    parts.push(`<polygon points="${topPoly}" fill="url(#sideA)"/>`);
+    parts.push(`<polygon points="${botPoly}" fill="url(#sideB)"/>`);
+    const seam = isPoster
+      ? `<line x1="0" y1="${h * 0.57}" x2="${w}" y2="${h * 0.43}"`
+      : `<line x1="${w * 0.57}" y1="0" x2="${w * 0.43}" y2="${h}"`;
+    parts.push(seam + ` stroke="${th.accent}" stroke-width="4" stroke-opacity="0.9"/>`);
+  }
+  parts.push(`<rect width="${w}" height="${h}" fill="url(#glowA)" opacity="${(c1 || c2) ? 0.35 : 1}"/>`);
+  parts.push(`<rect width="${w}" height="${h}" fill="url(#glowB)" opacity="${(c1 || c2) ? 0.5 : 1}"/>`);
   parts.push(`<g opacity="0.07" fill="#ffffff">` +
     `<polygon points="${w * 0.05},0 ${w * 0.20},0 ${w * 0.55},${h} ${w * 0.40},${h}"/>` +
     `<polygon points="${w * 0.45},0 ${w * 0.52},0 ${w * 0.90},${h} ${w * 0.83},${h}"/>` +
@@ -199,7 +277,7 @@ function generateLeagueCardSvg(spec = {}) {
     '</defs>';
 
   return `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">` +
-    defs + parts.join('') + '</svg>';
+    defs.replace('</defs>', (spec._splitDefs || '') + '</defs>') + parts.join('') + '</svg>';
 }
 
-module.exports = { generateLeagueCardSvg, detectCompetition, THEMES };
+module.exports = { generateLeagueCardSvg, detectCompetition, THEMES, dominantColor, teamColors };

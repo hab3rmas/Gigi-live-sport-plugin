@@ -1,4 +1,4 @@
-const { generateLeagueCardSvg, detectCompetition } = require('../src/services/LeagueCardService');
+const { generateLeagueCardSvg, detectCompetition, dominantColor } = require('../src/services/LeagueCardService');
 const { generateMatchCardSvg } = require('../src/services/MinimalistPosterService');
 
 describe('league cards', () => {
@@ -42,5 +42,31 @@ describe('league cards', () => {
       expect(generateMatchCardSvg({ category: 'football', league: 'La Liga', team1: 'A', team2: 'B' })).toContain('<svg');
     } finally { delete process.env.MATCH_CARD_STYLE; }
     expect(generateMatchCardSvg({ category: 'football', league: 'La Liga', team1: 'A', team2: 'B', shape: 'poster' })).toContain('LA LIGA');
+  });
+});
+
+describe('team colours', () => {
+  const uri = (fill) => 'data:image/svg+xml;base64,' + Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#fff"/><circle cx="50" cy="50" r="38" fill="${fill}"/></svg>`).toString('base64');
+
+  test('picks the crest colour and ignores white backgrounds', async () => {
+    const c = await dominantColor(uri('#a50044'));
+    expect(c).toMatch(/^#[0-9a-f]{6}$/);
+    const [r, g, b] = [1, 3, 5].map(i => parseInt(c.slice(i, i + 2), 16));
+    expect(r).toBeGreaterThan(120);
+    expect(g).toBeLessThan(60);
+    expect(b).toBeLessThan(110);
+  });
+
+  test('returns null for greyscale crests and non-data input', async () => {
+    expect(await dominantColor(uri('#888888'))).toBeNull();
+    expect(await dominantColor('https://x/y.png')).toBeNull();
+    expect(await dominantColor(null)).toBeNull();
+  });
+
+  test('card uses a two-team split only when colours are provided', () => {
+    const base = { league: 'La Liga', team1: 'A', team2: 'B', shape: 'landscape' };
+    expect(generateLeagueCardSvg(base)).not.toContain('id="sideA"');
+    expect(generateLeagueCardSvg({ ...base, color1: '#a50044', color2: '#004170' })).toContain('id="sideA"');
   });
 });
