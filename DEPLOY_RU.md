@@ -40,3 +40,27 @@ docker compose up -d --build     # кэш матчей в ./data сохраня�
 ## Диагностика
 - `https://ДОМЕН/health` — память, открытые circuit breaker'ы, кэш стримов, дочерние процессы.
 - `https://ДОМЕН/api/provider-health` — состояние каждого провайдера после синка.
+
+## Прокси для всего исходящего трафика (xray)
+Все запросы аддона (источники, плейлисты, сегменты, расшифровка, логотипы) можно пустить через один прокси.
+Локальные адреса, внутренний резолвер и Caddy идут напрямую.
+
+**Важно:** токены в ссылках привязаны к IP. Если у xray балансировщик (`leastPing` и т.п.), выход может смениться между
+запросом плейлиста и сегментов, и CDN ответит 403. Поэтому для аддона нужен **отдельный вход xray с фиксированным выходом**:
+
+```bash
+# 1) добавить вход nuvio-in (порт 1081) -> выбранный выход; остальные входы и правила не трогаются
+python3 deploy/xray-add-inbound.py /opt/smm-ve/deploy/xray/config.json proxy-finland
+docker exec smm-ve-xray-1 xray run -test -config /etc/xray/config.json   # проверка конфига
+docker restart smm-ve-xray-1                                              # секунда простоя xray
+
+# 2) .env аддона
+echo 'OUTBOUND_PROXY_URL=socks5://smm-ve-xray-1:1081' >> .env
+echo 'XRAY_NETWORK=smm-ve_internal' >> .env
+
+# 3) запуск с подключением к сети xray
+docker compose -f docker-compose.yml -f docker-compose.xray.yml up -d --build
+docker compose logs nuvio | grep outboundProxy    # должно быть: outbound traffic -> socks5://...
+```
+Сменить страну выхода: поправить `outboundTag` в правиле для `nuvio-in` и перезапустить xray.
+Вернуть как было: убрать `OUTBOUND_PROXY_URL` из `.env` и запускать без `docker-compose.xray.yml`.

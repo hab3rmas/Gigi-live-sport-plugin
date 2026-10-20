@@ -120,8 +120,7 @@ global.fetch = async (url, opts) => {
     const proxyUrl = targetOrigin + '/fetch';
     
     try {
-      const { Agent } = require('undici');
-      const keepAliveAgent = new Agent({ connect: { timeout: 30000 }, keepAliveTimeout: 15000, keepAliveMaxTimeout: 30000 });
+      const keepAliveAgent = require('./outboundProxy').makeDispatcher({ connect: { timeout: 30000 }, keepAliveTimeout: 15000, keepAliveMaxTimeout: 30000 });
       
       const fetchOpts = opts || (url.headers ? url : {});
       const reqHeaders = new Headers(fetchOpts.headers || {});

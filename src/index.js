@@ -12,6 +12,8 @@
  * from any origin without a networkError_manifestLoadError.
  */
 
+// Must be first: routes every outbound request through OUTBOUND_PROXY_URL when set.
+require('./providers/outboundProxy');
 require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');

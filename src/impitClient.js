@@ -13,7 +13,8 @@
 
 'use strict';
 
-const { request: undiciRequest, Agent } = require('undici');
+const { request: undiciRequest } = require('undici');
+const outboundProxy = require('./providers/outboundProxy');
 // -- Singleton -----------------------------------------------------------------
 // undefined  = not yet probed
 // null       = probed and unavailable (native binary missing / bad arch)
@@ -41,7 +42,7 @@ function getImpit() {
   if (_impitInstance !== undefined) return _impitInstance;
   try {
     const { Impit } = require('impit');
-    _impitInstance = new Impit({ browser: 'chrome142' });
+    _impitInstance = new Impit({ browser: 'chrome142', ...(outboundProxy.impitProxyUrl() ? { proxyUrl: outboundProxy.impitProxyUrl() } : {}) });
     _impitBornAt = Date.now();
     console.log('[impitClient] impit native client loaded successfully.');
   } catch (e) {
@@ -84,7 +85,7 @@ function isDamitvTarget(url) {
 }
 
 // -- Shared undici keep-alive agent -------------------------------------------
-const _undiciAgent = new Agent({
+const _undiciAgent = outboundProxy.makeDispatcher({
   connect: { timeout: 20000, rejectUnauthorized: false },
   keepAliveTimeout: 15000,
   keepAliveMaxTimeout: 30000,

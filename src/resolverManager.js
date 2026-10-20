@@ -96,7 +96,7 @@ async function spawnResolver() {
     } catch (_) {}
   }
 
-  const spawnEnv = { ...process.env, PORT: RESOLVER_PORT, HOST: '127.0.0.1' };
+  const spawnEnv = require('./providers/outboundProxy').childEnv({ ...process.env, PORT: RESOLVER_PORT, HOST: '127.0.0.1' });
   resolverProcess = child_process['sp' + 'awn']('node', [scriptPath], {
     stdio: 'pipe',
     env: spawnEnv

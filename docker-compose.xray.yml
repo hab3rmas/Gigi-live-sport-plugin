@@ -1,0 +1,17 @@
+# Optional override: join the addon to the docker network of an existing xray
+# container so OUTBOUND_PROXY_URL can point at it (e.g. socks5://smm-ve-xray-1:1081).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.xray.yml up -d --build
+#
+# XRAY_NETWORK is the name of the network the xray container is attached to
+# (`docker inspect <xray container> --format '{{json .NetworkSettings.Networks}}'`).
+services:
+  nuvio:
+    networks:
+      - default
+      - xray
+
+networks:
+  xray:
+    external: true
+    name: ${XRAY_NETWORK:-smm-ve_internal}

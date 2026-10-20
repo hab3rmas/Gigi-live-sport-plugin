@@ -105,7 +105,7 @@ function execFile(file, args, opts, cb) {
 
   acquire(() => {
     stats.started++;
-    const env = { ...process.env, ...(options.env || {}) };
+    const env = require('../providers/outboundProxy').childEnv({ ...process.env, ...(options.env || {}) });
     if (compileCacheDir && !env.NODE_COMPILE_CACHE) env.NODE_COMPILE_CACHE = compileCacheDir;
     let released = false;
     const done = (err, stdout, stderr) => {

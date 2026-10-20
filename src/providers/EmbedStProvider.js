@@ -46,7 +46,7 @@ class EmbedStProvider extends BaseProvider {
     if (streams.length === 0 && !embedUrl.includes('sportsembed.su')) {
       try {
         const { safeFetch } = require('../impitClient');
-        const dispatcher = new (require('undici').Agent)({ keepAliveTimeout: 15000, keepAliveMaxTimeout: 30000, connect: { timeout: 15000 } });
+        const dispatcher = require('./outboundProxy').makeDispatcher({ keepAliveTimeout: 15000, keepAliveMaxTimeout: 30000, connect: { timeout: 15000 } });
         const htmlRes = await safeFetch(embedUrl, {
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',

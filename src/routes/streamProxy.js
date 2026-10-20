@@ -31,14 +31,15 @@ function waitDrainOrClose(res) {
 }
 const router = express.Router();
 
-const hlsChunkHttpsAgent = new https.Agent({
+const outboundProxy = require('../providers/outboundProxy');
+const hlsChunkHttpsAgent = outboundProxy.makeNodeAgent('https', {
   keepAlive: true,
   keepAliveMsecs: 30000,
   maxSockets: 100,
   maxFreeSockets: 20,
   timeout: 15000
 });
-const hlsChunkHttpAgent = new http.Agent({
+const hlsChunkHttpAgent = outboundProxy.makeNodeAgent('http', {
   keepAlive: true,
   keepAliveMsecs: 30000,
   maxSockets: 100,

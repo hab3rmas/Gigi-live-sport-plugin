@@ -54,3 +54,8 @@
 
 ## Тесты
 973/973 (в оригинале 951/953). Новые регрессионные тесты — `tests/forkStability.test.js`, `tests/segmentRelay.test.js`.
+
+## Прокси
+`OUTBOUND_PROXY_URL` (socks5/http) направляет весь исходящий трафик аддона — node http/https, undici, встроенный fetch,
+impit и дочерние процессы (расшифровка, резолвер) — через один прокси с удалённым DNS; локальные хосты идут напрямую.
+`src/providers/outboundProxy.js`, `docker-compose.xray.yml`, `deploy/xray-add-inbound.py`, тесты `tests/outboundProxy.test.js`.
