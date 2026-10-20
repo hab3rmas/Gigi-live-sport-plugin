@@ -636,6 +636,18 @@ class TeamLogoService {
     ingest(CACHE_FILE);
   }
 
+  // Debounced persistence: crests found online survive restarts even when
+  // fewer than 20 were discovered (the old every-20th rule lost them).
+  _scheduleSave() {
+    if (this._saveTimer) return;
+    this._saveTimer = setTimeout(() => { this._saveTimer = null; this._saveDiskCache(); }, 5000);
+    if (this._saveTimer.unref) this._saveTimer.unref();
+    if (!this._exitHooked) {
+      this._exitHooked = true;
+      process.once('exit', () => { if (this._saveTimer) this._saveDiskCache(); });
+    }
+  }
+
   _saveDiskCache() {
     try {
       const obj = {};
@@ -862,7 +874,7 @@ class TeamLogoService {
               const badgeUrl = bestTeam.strBadge;
               const prev = this.cache.get(key);
               this.cache.set(key, { url: badgeUrl, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
-              if (this.cache.size % 20 === 0) this._saveDiskCache();
+              this._scheduleSave();
               // A crest that wasn't there before changes how match cards render —
               // tell generation-keyed caches to rebuild.
               if (!prev || prev.url !== badgeUrl) this._notifyLogoChanged();
