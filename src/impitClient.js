@@ -213,6 +213,11 @@ async function safeFetch(url, opts = {}) {
         if (timer) clearTimeout(timer);
       }
     }
+    // The caller gave up (its own deadline / client disconnect): falling back
+    // to undici with an already-aborted signal only produces a second error.
+    if (signal && signal.aborted) {
+      throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    }
     if (proxyUrl) {
       throw lastErr || new Error(`[impitClient] impit proxy fetch failed for ${url}`);
     }

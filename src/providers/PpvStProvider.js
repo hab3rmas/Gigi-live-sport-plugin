@@ -131,6 +131,9 @@ class PpvStProvider extends BaseProvider {
         const proxyUrl = `${BASE_URL}/api/manifest?url=${encodeURIComponent(m3u8Url)}&referer=${encodeURIComponent(referer)}&origin=${encodeURIComponent(origin)}`;
         
           const langStr = src.language ? ` [${src.language.toUpperCase()}]` : '';
+          // chanStr was referenced but never defined, so every PpvSt resolve threw
+          // ("chanStr is not defined") and the provider never returned a stream.
+          const chanStr = src.channelName ? ` - ${src.channelName}` : '';
           const isTikTokStream = Boolean(/admin|strmd\.st|\.image|tiktokcdn|byteoversea/i.test(m3u8Url) || /admin|strmd\.st|\.image|tiktokcdn/i.test(embedUrl));
           const s = new StreamEntity({
             name: 'PpvSt',
