@@ -767,6 +767,13 @@ function generateMatchCardSvg(spec = {}) {
     return generateCombatCardSvg(spec, w, h, isPoster);
   }
 
+  if (catKey === 'football') {
+    try {
+      const leagueSvg = require('./LeagueCardService').generateLeagueCardSvg(spec);
+      if (leagueSvg) return leagueSvg;
+    } catch (_) { /* fall through to the generic card */ }
+  }
+
   const cfg = SPORT_CONFIGS[catKey] || SPORT_CONFIGS.other;
   const accent = cfg.accent || CARD_FALLBACK_ACCENT;
 

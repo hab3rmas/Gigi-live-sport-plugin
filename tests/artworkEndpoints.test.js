@@ -1,5 +1,8 @@
 'use strict';
 
+// These tests pin the generic card; league-branded cards are covered in leagueCard.test.js.
+process.env.MATCH_CARD_STYLE = 'classic';
+
 /**
  * Tests for the generated artwork endpoints and the score-aware match card.
  *
