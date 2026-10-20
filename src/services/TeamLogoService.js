@@ -556,11 +556,20 @@ const CURATED_BADGES = {
 // TheSportsDB API key and per-minute request budget (free key "123" allows
 // roughly 30 requests per minute).
 const SPORTSDB_KEY = process.env.THESPORTSDB_API_KEY || '123';
-const SPORTSDB_RPM = Math.max(1, Number(process.env.THESPORTSDB_RPM) || 25);
+const SPORTSDB_RPM = Math.max(1, Number(process.env.THESPORTSDB_RPM) || 10);
 let _sportsDbWindowStart = 0;
 let _sportsDbCount = 0;
+let _sportsDbBlockedUntil = 0;
+// Cloudflare answers an over-limit client with 429 / error 1015 and keeps
+// refusing for a while; hammering it only extends the ban. Back off globally.
+function _sportsDbBackoff(retryAfterHeader) {
+  const ra = Number(retryAfterHeader);
+  const ms = Math.max(60000, Number.isFinite(ra) ? ra * 1000 : 0);
+  _sportsDbBlockedUntil = Date.now() + ms;
+}
 function _sportsDbTakeToken() {
   const now = Date.now();
+  if (now < _sportsDbBlockedUntil) return false;
   if (now - _sportsDbWindowStart >= 60000) {
     _sportsDbWindowStart = now;
     _sportsDbCount = 0;
@@ -869,6 +878,11 @@ class TeamLogoService {
         }
 
         // On rate-limits (429) or server errors, do not write a negative cache entry
+        if (res && res.status === 429) {
+          const h = res.headers;
+          const ra = h && (typeof h.get === 'function' ? h.get('retry-after') : h['retry-after']);
+          _sportsDbBackoff(ra);
+        }
         return null;
       } catch (_) {
         return null;
