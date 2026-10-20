@@ -274,9 +274,33 @@ function isReservedHostname(hostname) {
 
 // ─── Default resolver ────────────────────────────────────────────────────────
 
+// Every proxied segment / manifest request ran a fresh getaddrinfo() here
+// (libuv thread pool, tens of ms on a cold resolver), then fetch() resolved the
+// same host again. Successful lookups are cached briefly; failures are not, so
+// a recovering host is retried immediately. In-flight lookups are coalesced.
+const DNS_CACHE_TTL_MS = Number(process.env.OUTBOUND_DNS_CACHE_MS) || 60000;
+const DNS_CACHE_MAX = 2000;
+const _dnsCache = new Map(); // hostname -> { addresses, expiresAt }
+const _dnsInFlight = new Map(); // hostname -> Promise<string[]>
+
 async function defaultResolve(hostname) {
-  const records = await dns.promises.lookup(hostname, { all: true, verbatim: true });
-  return records.map(record => record.address);
+  const now = Date.now();
+  const hit = _dnsCache.get(hostname);
+  if (hit && hit.expiresAt > now) return hit.addresses;
+  const pending = _dnsInFlight.get(hostname);
+  if (pending) return pending;
+  const p = dns.promises.lookup(hostname, { all: true, verbatim: true })
+    .then((records) => {
+      const addresses = records.map(record => record.address);
+      if (addresses.length) {
+        if (_dnsCache.size >= DNS_CACHE_MAX) _dnsCache.delete(_dnsCache.keys().next().value);
+        _dnsCache.set(hostname, { addresses, expiresAt: Date.now() + DNS_CACHE_TTL_MS });
+      }
+      return addresses;
+    })
+    .finally(() => _dnsInFlight.delete(hostname));
+  _dnsInFlight.set(hostname, p);
+  return p;
 }
 
 // ─── The gate ────────────────────────────────────────────────────────────────

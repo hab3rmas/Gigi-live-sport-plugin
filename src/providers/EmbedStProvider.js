@@ -1,6 +1,6 @@
 const BaseProvider = require('./BaseProvider');
 const StreamEntity = require('../domain/StreamEntity');
-const { execFile } = require('child_process');
+const { execFile } = require('../services/childProcessLimiter');
 const path = require('path');
 
 class EmbedStProvider extends BaseProvider {

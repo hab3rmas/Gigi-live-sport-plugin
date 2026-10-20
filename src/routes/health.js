@@ -68,6 +68,7 @@ router.get('/health', (_, res) => {
     openBreakers,
     breakerCount: breakers ? Object.keys(breakers).length : null,
     streamResolveCache: cache,
+    childProcesses: (() => { try { return require('../services/childProcessLimiter').getStats(); } catch (_) { return null; } })(),
   });
 });
 

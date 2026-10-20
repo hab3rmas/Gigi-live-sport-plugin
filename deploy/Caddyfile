@@ -1,0 +1,20 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Internal resolver cache: never public (the app blocks it too).
+	@internal path /api/cache /api/cache/* /api/cache-stats /api/matches
+	respond @internal 404
+
+	reverse_proxy nuvio:7000 {
+		# Video/playlist responses must stream straight through.
+		flush_interval -1
+		transport http {
+			keepalive 90s
+			keepalive_idle_conns 64
+		}
+	}
+}

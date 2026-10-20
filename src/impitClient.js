@@ -107,7 +107,7 @@ const MAX_REDIRECT_HOPS = 5;
  * @returns {{ ok, status, text: () => string, json: () => object }}
  */
 async function safeFetch(url, opts = {}) {
-  const { signal, timeoutMs = 15000, attempts = 3 } = opts;
+  const { signal, timeoutMs = 15000, attempts = Number(process.env.IMPIT_ATTEMPTS) || 2 } = opts;
   // Method, headers and body are reassigned per redirect hop on the undici path
   // (see the redirect loop below), so they cannot be destructured as const.
   let { method = 'GET', headers = {}, body } = opts;
@@ -134,17 +134,31 @@ async function safeFetch(url, opts = {}) {
   if (impit) {
     let lastErr = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      // The caller gave up (deadline hit upstream); stop burning its budget.
       if (signal && signal.aborted) throw Object.assign(new Error('aborted before impit attempt'), { name: 'AbortError' });
+      // One AbortController per attempt, tied to BOTH the caller's signal and
+      // our own deadline, and handed to impit itself. The previous version
+      // raced impit.fetch() against a timer: the timer "won", but the native
+      // request kept running (sockets + native memory leaked until the 90-min
+      // instance recycle), the caller's abort never reached impit, and the
+      // body read below was not covered by any timeout at all.
+      const attemptCtrl = new AbortController();
+      const onOuterAbort = () => { try { attemptCtrl.abort(); } catch (_) {} };
+      if (signal) signal.addEventListener('abort', onOuterAbort, { once: true });
       let timer = null;
       try {
-        const res = await Promise.race([
-          impit.fetch(url, { method, headers, body }),
+        const { r: res, b: buf } = await Promise.race([
+          (async () => {
+            const r = await impit.fetch(url, { method, headers, body, signal: attemptCtrl.signal, timeout: timeoutMs });
+            const b = await r.arrayBuffer();
+            return { r, b };
+          })(),
           new Promise((_, rej) => {
-            timer = setTimeout(() => rej(new Error(`impit timeout ${timeoutMs}ms`)), timeoutMs);
+            timer = setTimeout(() => {
+              try { attemptCtrl.abort(); } catch (_) {}
+              rej(new Error(`impit timeout ${timeoutMs}ms`));
+            }, timeoutMs);
           }),
         ]);
-        const buf = await res.arrayBuffer();
         if (res.status === 400 && url.includes('ok.ru')) {
            throw new Error('ok.ru blocked impit');
         }

@@ -10,7 +10,7 @@ const {
   MANIFEST_TTL_MS, playlistHasContent,
   manifestCacheGet, manifestCacheSet, manifestCacheSetNegative,
   notifyResolveCacheOfDeadStream, fetchUpstreamManifest,
-  manifestInFlight
+  manifestInFlight, manifestLastGoodSet, manifestLastGoodGet, liveManifestTtl
 } = require('../manifestProxy');
 const {
   readRck, getRemintCacheKey, remintCache, mergeRemintedUrl, isExpiryStatus, attemptRemint
@@ -91,27 +91,21 @@ router.get('/api/manifest', async (req, res) => {
           throw new Error('Upstream playlist has no media entries');
         }
 
-        let dynamicTtl = MANIFEST_TTL_MS;
-        try {
-          const m3u8Parser = require('m3u8-parser');
-          const parser = new m3u8Parser.Parser();
-          parser.push(out);
-          parser.end();
-          if (parser.manifest.targetDuration) {
-            dynamicTtl = (parser.manifest.targetDuration * 1000) / 2;
-          }
-        } catch (e) {
-          // Fallback to default TTL on parse error
-        }
-
         const isLive = !out.includes('#EXT-X-ENDLIST');
         const isMaster = out.includes('#EXT-X-STREAM-INF');
 
-        // Master playlists can be cached longer, but live media playlists must refresh dynamically (2-3s)
+        // Master playlists rarely change: cache them longer. Live media
+        // playlists are re-served only briefly (see liveManifestTtl) so the
+        // player is never held behind the live edge by our own cache. VOD
+        // media playlists keep the original target-duration based TTL.
+        let dynamicTtl = MANIFEST_TTL_MS;
         if (isMaster) {
           dynamicTtl = 60000;
         } else if (isLive) {
-          dynamicTtl = Math.min(dynamicTtl, 3000);
+          dynamicTtl = liveManifestTtl(out);
+        } else {
+          const td = /#EXT-X-TARGETDURATION:\s*([\d.]+)/.exec(out);
+          if (td) dynamicTtl = Math.max(MANIFEST_TTL_MS, (parseFloat(td[1]) * 1000) / 2);
         }
         let injectedStart = out.includes('#EXT-X-START');
 
@@ -142,6 +136,7 @@ router.get('/api/manifest', async (req, res) => {
 
         const rewrittenResult = rewritten.join('\n');
         manifestCacheSet(cacheKey, rewrittenResult, dynamicTtl);
+        manifestLastGoodSet(cacheKey, rewrittenResult);
         return rewrittenResult;
       })().finally(() => {
         manifestInFlight.delete(cacheKey);
@@ -155,6 +150,25 @@ router.get('/api/manifest', async (req, res) => {
     res.setHeader('X-Manifest-Cache', 'MISS');
     res.send(finalBody);
   } catch (err) {
+    // stale-if-error: a transient upstream failure (timeout, reset, 5xx) on a
+    // stream that was working seconds ago is served from the last good copy,
+    // so a single blip does not stall or kill playback. Expiry/auth answers
+    // still fail over below.
+    {
+      const st = err && err.statusCode;
+      const isAuthOrGone = st === 401 || st === 403 || st === 404 || st === 410;
+      const isBadBody = err && (err.message === 'Upstream returned non-m3u8 body' || err.message === 'Upstream playlist has no media entries');
+      if (!isAuthOrGone && !isBadBody) {
+        const stale = manifestLastGoodGet(cacheKey);
+        if (stale) {
+          console.warn(`[ManifestProxy] Upstream ${st || (err && err.message) || 'error'}; serving last good playlist (stale-if-error)`);
+          res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('X-Manifest-Cache', 'STALE');
+          return res.send(stale);
+        }
+      }
+    }
     // Preserve the old 404 semantics so players can fail over to another stream.
     // Failures are negatively cached (15 s) so player polls stop hammering the dead upstream.
     // In parallel, drop the originating resolve-cache entry so the next click mints fresh.

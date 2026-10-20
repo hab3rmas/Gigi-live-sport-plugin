@@ -1,13 +1,46 @@
-version: '3.8'
-
+# Personal VPS deployment: addon + Caddy (automatic HTTPS).
+#
+#   1. cp .env.example .env   and set DOMAIN + ACME_EMAIL
+#   2. point the domain's A record at this server
+#   3. docker compose up -d --build
+#
+# Stremio/Nuvio then install https://<DOMAIN>/manifest.json
 services:
   nuvio:
     build: .
     container_name: nuvio-live-sports
-    ports:
-      - "7000:7000"
+    init: true                 # reaps the extractor child processes
+    restart: unless-stopped
+    env_file: .env
     environment:
       - PORT=7000
-      # If you are hosting this on a public VPS, uncomment the line below and set your domain or IP
-      # - ADDON_URL=http://your-server-ip:7000
+      - ADDON_URL=https://${DOMAIN}
+    volumes:
+      - ./data:/app/data       # match cache + logo cache survive restarts
+    expose:
+      - "7000"
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: nuvio-caddy
     restart: unless-stopped
+    depends_on: [nuvio]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"          # HTTP/3
+    environment:
+      - DOMAIN=${DOMAIN}
+      - ACME_EMAIL=${ACME_EMAIL}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

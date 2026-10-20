@@ -147,7 +147,12 @@ function shutdownResolver() {
   try { container.resolve('browserSniffer').shutdown(); } catch (_) {}
 }
 process.on('exit', shutdownResolver);
-process.on('SIGINT', () => { shutdownResolver(); process.exit(0); });
-process.on('SIGTERM', () => { shutdownResolver(); process.exit(0); });
+// SIGINT/SIGTERM are handled by index.js (graceful drain, then
+// shutdownResolver). When this module is used without index.js, fall back to
+// the previous immediate behaviour.
+setImmediate(() => {
+  if (process.listenerCount('SIGTERM') === 0) process.on('SIGTERM', () => { shutdownResolver(); process.exit(0); });
+  if (process.listenerCount('SIGINT') === 0) process.on('SIGINT', () => { shutdownResolver(); process.exit(0); });
+});
 
 module.exports = { workerOffset, RESOLVER_PORT, spawnResolver, shutdownResolver };

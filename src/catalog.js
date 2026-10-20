@@ -907,6 +907,40 @@ function _stableSig(obj) {
   return Object.keys(obj).sort().map(k => `${k}=${_stableSig(obj[k])}`).join('&');
 }
 
+// Request-path sync guard.
+//
+// Catalog rows used to await a FULL provider sync whenever a sport had no
+// replays. Off-season sports (and empty hubs) hit that on every request, so a
+// collection screen fanned out several full syncs at once. Now:
+//   - all callers share the aggregator's single in-flight sync;
+//   - a populated cache never blocks the request: an empty sport is a valid
+//     answer, and a background refresh is requested via the cron SWR path;
+//   - only a truly cold cache waits, and even then for a bounded time.
+const REQUEST_SYNC_WAIT_MS = Number(process.env.REQUEST_SYNC_WAIT_MS) || 20000;
+async function _requestPathSync(rawMatches) {
+  const current = Array.isArray(rawMatches) ? rawMatches : [];
+  try {
+    const aggregator = container.resolve('matchAggregator');
+    if (current.length > 0) {
+      // Staleness-gated background refresh (same SWR path as every catalog
+      // hit); never awaited by the request.
+      try { container.resolve('cronService').ensureFresh(); } catch (_) {}
+      return current;
+    }
+    let timer;
+    const synced = await Promise.race([
+      Promise.resolve(aggregator.syncMatches()).catch(() => null),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), REQUEST_SYNC_WAIT_MS); }),
+    ]).finally(() => clearTimeout(timer));
+    if (Array.isArray(synced) && synced.length > 0) return synced;
+    const cacheService = container.resolve('cacheService');
+    const fresh = (cacheService.getMatchesReadOnly ? cacheService.getMatchesReadOnly() : cacheService.getMatches()) || [];
+    return fresh.length > 0 ? fresh : current;
+  } catch (_) {
+    return current;
+  }
+}
+
 async function handleCatalog(type, id, extra, config) {
   if (type !== 'tv' && type !== 'series' && type !== 'channel') return { metas: [] };
   if (!id.startsWith('nuvio_sports_')) return { metas: [] };
@@ -919,30 +953,54 @@ async function handleCatalog(type, id, extra, config) {
   try {
     const cacheService = container.resolve('cacheService');
     const gen = (cacheService && cacheService.rev) || 0;
+    // Pages are keyed on the DATA revision. An artwork-only bump (logo
+    // enrichment fires every ~20 s after a sync) no longer throws every page
+    // away: the existing page is served immediately and rebuilt once in the
+    // background. A real match-set change still rebuilds before answering.
+    const dataGen = (cacheService && typeof cacheService.dataRev === 'number') ? cacheService.dataRev : gen;
     const conf = config || (extra && extra.config) || {};
-    const pageKey = `${type}|${id}|${_stableSig(extra || {})}|${_stableSig(conf)}|${gen}`;
+    const pageKey = `${type}|${id}|${_stableSig(extra || {})}|${_stableSig(conf)}|${dataGen}`;
 
+    const now = Date.now();
     const hit = _catalogPageCache.get(pageKey);
-    if (hit && Date.now() <= hit.expiresAt) {
-      // LRU promote (Map preserves insertion order)
+    if (hit) {
       _catalogPageCache.delete(pageKey);
-      _catalogPageCache.set(pageKey, hit);
-      return hit.result;
+      _catalogPageCache.set(pageKey, hit); // LRU promote
+      const fresh = hit.gen === gen && now <= hit.expiresAt;
+      if (fresh) return hit.result;
+      if (now <= hit.expiresAt + CATALOG_PAGE_STALE_MAX_MS) {
+        _buildCatalogPage(pageKey, gen, type, id, extra, config).catch(() => {});
+        return hit.result;
+      }
+      _catalogPageCache.delete(pageKey);
     }
-    if (hit) _catalogPageCache.delete(pageKey);
+    return await _buildCatalogPage(pageKey, gen, type, id, extra, config);
+  } catch (_) {
+    // Memoization must never break the request path.
+    return handleCatalogUncached(type, id, extra, config);
+  }
+}
 
+// Single-flight page builds: concurrent misses for the same page used to
+// each run the full 0.8-2 s build; they now share one.
+const CATALOG_PAGE_STALE_MAX_MS = 25 * 60 * 1000;
+const _catalogPageBuilds = new Map(); // pageKey -> Promise<result>
+function _buildCatalogPage(pageKey, gen, type, id, extra, config) {
+  const pending = _catalogPageBuilds.get(pageKey);
+  if (pending) return pending;
+  const p = (async () => {
     const result = await handleCatalogUncached(type, id, extra, config);
     if (result && Array.isArray(result.metas)) {
-      if (_catalogPageCache.size >= CATALOG_PAGE_CACHE_MAX) {
+      _catalogPageCache.delete(pageKey);
+      while (_catalogPageCache.size >= CATALOG_PAGE_CACHE_MAX) {
         _catalogPageCache.delete(_catalogPageCache.keys().next().value);
       }
       _catalogPageCache.set(pageKey, { result, gen, expiresAt: Date.now() + CATALOG_PAGE_TTL_MS });
     }
     return result;
-  } catch (_) {
-    // Memoization must never break the request path.
-    return handleCatalogUncached(type, id, extra, config);
-  }
+  })().finally(() => _catalogPageBuilds.delete(pageKey));
+  _catalogPageBuilds.set(pageKey, p);
+  return p;
 }
 
 async function buildReplayHubMeta(id, config = {}) {
@@ -955,11 +1013,7 @@ async function buildReplayHubMeta(id, config = {}) {
   let rawMatches = (cacheService.getMatchesReadOnly ? cacheService.getMatchesReadOnly() : cacheService.getMatches()) || [];
 
   if (rawMatches.length === 0 || !rawMatches.some(m => isReplayMatch(m))) {
-    try {
-      const aggregator = container.resolve('matchAggregator');
-      const synced = await aggregator.syncMatches();
-      if (synced && synced.length > 0) rawMatches = synced;
-    } catch (_) {}
+    rawMatches = await _requestPathSync(rawMatches);
   }
   const replayMatches = filterReplayMatches(
     rawMatches.filter(m => isReplayMatch(m) && m.sources && m.sources.some(s => REPLAY_SOURCES.has(s.source))),
@@ -1205,11 +1259,7 @@ async function handleReplayCatalog(id, extra, config, reqType = 'tv') {
   // Check if target sport has 0 replays in memory/cache; if so, trigger aggregator sync
   const hasSportReplays = rawMatches.some(m => isReplayMatch(m) && (targetSport === 'other' || m.category === targetSport));
   if (rawMatches.length === 0 || !hasSportReplays) {
-    try {
-      const aggregator = container.resolve('matchAggregator');
-      const synced = await aggregator.syncMatches();
-      if (synced && synced.length > 0) rawMatches = synced;
-    } catch (_) {}
+    rawMatches = await _requestPathSync(rawMatches);
   }
 
   let matches = rawMatches.filter(m => {

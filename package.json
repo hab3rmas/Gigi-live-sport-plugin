@@ -31,6 +31,7 @@
     "awilix": "^13.0.5",
     "big-integer": "^1.6.52",
     "cheerio": "^1.2.0",
+    "compression": "^1.8.2",
     "cors": "^2.8.5",
     "curl-impersonate": "^0.0.0",
     "dotenv": "^17.4.2",

@@ -13,8 +13,49 @@ const { safeFetch: _safeFetch } = require('./impitClient');
 // short-TTL cache removes per-viewer TLS handshakes and repeated upstream
 // fetches. Key = url|referer|origin. Only bodies containing #EXT are cached.
 const MANIFEST_TTL_MS = 3000;
+const MANIFEST_FETCH_TIMEOUT_MS = Number(process.env.MANIFEST_FETCH_TIMEOUT_MS) || 6000;
 const MANIFEST_CACHE_MAX = 100;
-const MANIFEST_NEGATIVE_TTL_MS = 15 * 1000;
+// Negative cache for a dead playlist. Was 15 s, which meant ONE failed upstream
+// fetch blacked out the stream for every viewer for 15 s. Short now: enough to
+// absorb a player's rapid retry burst, short enough to recover quickly.
+const MANIFEST_NEGATIVE_TTL_MS = Number(process.env.MANIFEST_NEGATIVE_TTL_MS) || 4000;
+// Live media playlists: how long a fetched copy may be re-served. Each extra
+// second of cache is a second the player may sit behind the live edge (it
+// cannot see a segment the cached copy does not list yet). Clamp to
+// [MIN, MAX] around a quarter of EXT-X-TARGETDURATION.
+const LIVE_MANIFEST_TTL_MIN_MS = Number(process.env.LIVE_MANIFEST_TTL_MIN_MS) || 500;
+const LIVE_MANIFEST_TTL_MAX_MS = Number(process.env.LIVE_MANIFEST_TTL_MAX_MS) || 1000;
+// stale-if-error: on a TRANSIENT upstream failure (timeout, reset, 5xx) serve
+// the last good playlist for this window instead of failing the player. Not
+// used for auth/expiry answers (401/403/404/410), which must fail over.
+const MANIFEST_STALE_IF_ERROR_MS = Number(process.env.MANIFEST_STALE_IF_ERROR_MS) || 12000;
+const MANIFEST_LAST_GOOD_MAX = 200;
+const manifestLastGood = new Map(); // key -> { body, at }
+
+function manifestLastGoodSet(key, body) {
+  manifestLastGood.delete(key);
+  manifestLastGood.set(key, { body, at: Date.now() });
+  while (manifestLastGood.size > MANIFEST_LAST_GOOD_MAX) {
+    manifestLastGood.delete(manifestLastGood.keys().next().value);
+  }
+}
+
+function manifestLastGoodGet(key) {
+  const e = manifestLastGood.get(key);
+  if (!e) return null;
+  if (Date.now() - e.at > MANIFEST_STALE_IF_ERROR_MS) {
+    manifestLastGood.delete(key);
+    return null;
+  }
+  return e.body;
+}
+
+function liveManifestTtl(text) {
+  const m = /#EXT-X-TARGETDURATION:\s*([\d.]+)/.exec(text);
+  const td = m ? parseFloat(m[1]) : NaN;
+  const quarter = Number.isFinite(td) && td > 0 ? (td * 1000) / 4 : LIVE_MANIFEST_TTL_MAX_MS;
+  return Math.max(LIVE_MANIFEST_TTL_MIN_MS, Math.min(LIVE_MANIFEST_TTL_MAX_MS, quarter));
+}
 const manifestCache = new Map();      // key -> { body, expiresAt, lastAccess }
 const manifestInFlight = new Map();   // key -> Promise (coalesced upstream fetch)
 
@@ -94,7 +135,11 @@ async function fetchUpstreamManifest(targetUrl, referer, origin) {
   // _safeFetch: impit (browser TLS fingerprint) with automatic undici fallback.
   // A hard 10 s timeout ensures a hung upstream can never hold the viewer's poll.
   const attempt = async () => {
-    const result = await _safeFetch(targetUrl, { headers, timeoutMs: 10000 });
+    // One impit attempt with a tight budget: a live playlist that takes longer
+    // than a couple of target durations is useless to the player, and the
+    // outer single retry below already covers a transient blip. (The default
+    // safeFetch policy could spend ~40 s here before falling back.)
+    const result = await _safeFetch(targetUrl, { headers, timeoutMs: MANIFEST_FETCH_TIMEOUT_MS, attempts: 1 });
     if (!result.ok) {
       // Carry the upstream status so the caller can tell "the token/CDN said no"
       // apart from "our proxy is broken" — they need different HTTP responses.
@@ -120,7 +165,7 @@ async function fetchUpstreamManifest(targetUrl, referer, origin) {
     );
     const isTransient = status === 500 || status === 502 || status === 503 || status === 504 || isNetworkTransient;
     if (!isTransient) throw err;
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 250));
     console.warn(`[ManifestProxy] Upstream ${status || err.code || 'network glitch'} — retrying once: ${String(targetUrl).slice(0, 90)}`);
     return await attempt(); // a second failure propagates with statusCode intact
   }
@@ -129,6 +174,7 @@ async function fetchUpstreamManifest(targetUrl, referer, origin) {
 
 module.exports = {
   MANIFEST_TTL_MS, MANIFEST_CACHE_MAX, MANIFEST_NEGATIVE_TTL_MS,
+  MANIFEST_STALE_IF_ERROR_MS, manifestLastGood, manifestLastGoodSet, manifestLastGoodGet, liveManifestTtl,
   manifestCache, manifestInFlight,
   manifestCacheGet, manifestCacheSet, manifestCacheSetNegative, evictManifestCacheIfNeeded,
   notifyResolveCacheOfDeadStream, playlistHasContent, fetchUpstreamManifest

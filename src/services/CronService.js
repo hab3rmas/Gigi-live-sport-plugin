@@ -17,8 +17,16 @@ class CronService {
   set isSyncing(v) { this.syncing = v; }
 
   async runSync() {
+    // Watchdog: a sync stuck far beyond any provider deadline must not freeze
+    // the catalog forever. Release the flag so the next tick can try again.
+    const WATCHDOG_MS = Number(process.env.SYNC_WATCHDOG_MS) || 15 * 60 * 1000;
+    if (this.syncing && this._syncStartedAt && Date.now() - this._syncStartedAt > WATCHDOG_MS) {
+      console.error(`[CronService] Sync flag held for >${Math.round(WATCHDOG_MS / 60000)} min; releasing (watchdog).`);
+      this.syncing = false;
+    }
     if (this.syncing) return;
     this.syncing = true;
+    this._syncStartedAt = Date.now();
     try {
       const activeMatches = await this.matchAggregator.syncMatches();
       if (activeMatches !== null) {
@@ -82,8 +90,11 @@ class CronService {
   start() {
     console.log('[CronService] Starting background jobs...');
     
-    // Fetch and cache matches every 4 hours
-    cron.schedule('0 */4 * * *', async () => {
+    // Periodic full sync. Upstream default was every 4 hours (tuned for a busy
+    // public instance where traffic-driven SWR does most refreshes). A personal
+    // instance sees little traffic, so the floor is tighter; override with
+    // SYNC_CRON_SCHEDULE.
+    cron.schedule(process.env.SYNC_CRON_SCHEDULE || '*/30 * * * *', async () => {
       console.log('[CronService] Running match sync job...');
       try {
         await this.runSync();
@@ -133,15 +144,8 @@ class CronService {
       });
     }
 
-    // Run first sync immediately on boot
-    setTimeout(async () => {
-      try {
-        console.log('[CronService] Running initial match sync...');
-        await this.runSync();
-      } catch(e) {
-        console.error('[CronService] Match sync failed:', e.message);
-      }
-    }, 1000);
+    // (A second, duplicate boot sync used to be scheduled here one second
+    // later; the setImmediate above already performs the startup sync.)
   }
 
   /** Drop stream-cache entries for matches that are no longer active. */

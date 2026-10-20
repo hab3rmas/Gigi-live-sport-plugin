@@ -16,7 +16,9 @@ const DEFAULT_TTL_MS = 60 * 1000;
 const MIN_TTL_MS = 60 * 1000;
 const MAX_TTL_MS = 10 * 60 * 1000;
 const NEGATIVE_TTL_MS = 30 * 1000;
-const MAX_ENTRIES = 200;
+// 200 entries thrashed at peak (one key per source per match: 50 matches x a
+// handful of sources). Entries are a few KB, so 1000 is cheap.
+const MAX_ENTRIES = Number(process.env.RESOLVE_CACHE_MAX_ENTRIES) || 1000;
 const CHANNEL_MATCH_ID = '__channel__'; // evergreen 24/7 keys survive pruneEnded
 
 function cloneStream(stream) {

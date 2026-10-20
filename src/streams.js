@@ -235,7 +235,10 @@ const VERIFY_ATTEMPTS = Number(process.env.VERIFY_ATTEMPTS || 3);
 // the measured rate just reflects latency instead of throughput.
 const SPEED_PROBE_TIMEOUT_MS = Number(process.env.SPEED_PROBE_TIMEOUT_MS || 5000);
 const SPEED_PROBE_RANGE_BYTES = Number(process.env.SPEED_PROBE_RANGE_BYTES || 524288);
-const ENABLE_SPEED_PROBE = process.env.ENABLE_SPEED_PROBE !== 'false';
+// Off by default in this fork: the probe downloads ~512 KB of a segment for
+// EVERY candidate stream before the list is returned, which added 1-5 s to a
+// cold click for a ranking signal only. Set ENABLE_SPEED_PROBE=true to restore.
+const ENABLE_SPEED_PROBE = process.env.ENABLE_SPEED_PROBE === 'true';
 
 // Proxied /api/manifest URLs wrap an upstream token that expires on its own
 // schedule. Tag the URL with the resolve-cache key that produced it so the
@@ -988,73 +991,90 @@ async function handleStream(type, id, config) {
   const SOFT_DEADLINE_MS = Math.min(Number(process.env.STREAM_SOFT_DEADLINE_MS || 6000), HARD_DEADLINE_MS);
   const resolutionStartedAt = Date.now();
 
-  const inFlight = [];        // per-source promise + settled result for the fallback wait
-  const races = activeSources.map((src) => {
+  // Event-driven wait (replaces the old "await every source up to the soft
+  // deadline, then possibly wait for DaddyLive up to the hard deadline"):
+  //   - nothing yet            -> wait up to the hard deadline;
+  //   - first result arrived   -> collect siblings for a short grace window
+  //                               (STREAM_FIRST_RESULT_GRACE_MS), capped by the
+  //                               soft deadline;
+  //   - priority-1 still busy  -> give it until STREAM_PRIORITY_WAIT_MS from
+  //                               the start (it used to hold a ready list
+  //                               hostage for the full hard deadline).
+  // Everything still running keeps minting into the resolve cache, so the next
+  // open of the same match lists it instantly.
+  const FIRST_RESULT_GRACE_MS = Math.max(0, Number(process.env.STREAM_FIRST_RESULT_GRACE_MS || 1500));
+  const PRIORITY_WAIT_MS = Math.min(Number(process.env.STREAM_PRIORITY_WAIT_MS || 4000), HARD_DEADLINE_MS);
+
+  const inFlight = [];
+  let notify = null;
+  for (const src of activeSources) {
     const subKey = src.streamSource ? `:${src.streamSource}${src.streamId ? ':' + src.streamId : ''}` : '';
     const key = `${src.source}:${matchId}:${src.id}${subKey}`;
     const isPriority1 = src.source === 'daddylive' || SOURCE_PRIORITY[src.source] === 1;
     const state = { key, source: src.source, isPriority1, promise: null, settled: false, value: [] };
-    const promise = resolveCache
-      .getOrCreate(key, () => mintVerifiedSources(src, match, config, key))
+    state.promise = Promise.resolve()
+      .then(() => resolveCache.getOrCreate(key, () => mintVerifiedSources(src, match, config, key)))
       .then((minted) => {
         state.value = Array.isArray(minted) ? minted.map((st) => ({ ...st, _cacheKey: key })) : [];
-        state.settled = true;
-        return state.value;
       })
-      .catch(() => { state.settled = true; return []; });
-    state.promise = promise;
+      .catch(() => { state.value = []; })
+      .finally(() => {
+        state.settled = true;
+        if (notify) notify();
+      });
     inFlight.push(state);
-    // Wrap so we can tell "settled in time" from "still running".
-    return settleBefore(
-      promise.then((value) => ({ late: false, value })),
-      SOFT_DEADLINE_MS,
-      { late: true, value: [] }
-    );
-  });
-
-  const raced = await Promise.allSettled(races);
-  let lateCount = 0;
-  for (const r of raced) {
-    if (r.status !== 'fulfilled') continue;
-    if (r.value.late) { lateCount++; continue; }
-    if (Array.isArray(r.value.value)) streams.push(...r.value.value);
   }
 
-  // If nothing usable arrived by the soft deadline, OR if priority-1 sources (DaddyLive)
-  // are still in flight, wait for them up to the remaining hard budget.
-  // This guarantees fast streams (e.g. Vavoo) do not cut off DaddyLive with an early return,
-  // while still returning instantly as soon as DaddyLive completes (or when already cached).
-  const priority1InFlight = inFlight.filter(f => f.isPriority1 && !f.settled);
-  const shouldWait = (streams.length === 0 || priority1InFlight.length > 0) && inFlight.length > 0;
+  if (inFlight.length > 0) {
+    let firstResultAt = 0;
+    await new Promise((resolve) => {
+      let timer = null;
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        notify = null;
+        if (timer) clearTimeout(timer);
+        timer = null;
+        resolve();
+      };
+      const evaluate = () => {
+        if (done) return;
+        const now = Date.now();
+        const elapsed = now - resolutionStartedAt;
+        const allSettled = inFlight.every((f) => f.settled);
+        const haveStreams = inFlight.some((f) => f.settled && f.value.length > 0);
+        if (haveStreams && !firstResultAt) firstResultAt = now;
+        if (allSettled || elapsed >= HARD_DEADLINE_MS) return finish();
 
-  if (shouldWait) {
-    const remaining = Math.max(0, HARD_DEADLINE_MS - (Date.now() - resolutionStartedAt));
-    if (remaining > 0) {
-      // If we already have streams and are waiting for Priority-1 (DaddyLive), wait specifically
-      // for the Priority-1 promises to complete so we return immediately without stalling.
-      const waitTargets = priority1InFlight.length > 0
-        ? priority1InFlight.map((f) => f.promise)
-        : inFlight.map((f) => f.promise);
-
-      await settleBefore(
-        Promise.allSettled(waitTargets),
-        remaining,
-        null
-      );
-    }
-    for (const f of inFlight) {
-      // Snapshot newly settled resolutions without duplicating
-      if (f.settled && Array.isArray(f.value)) {
-        for (const st of f.value) {
-          if (!streams.includes(st)) {
-            streams.push(st);
+        let targetAt;
+        if (!haveStreams) {
+          targetAt = resolutionStartedAt + HARD_DEADLINE_MS;
+        } else {
+          const p1Pending = inFlight.some((f) => f.isPriority1 && !f.settled);
+          targetAt = firstResultAt + FIRST_RESULT_GRACE_MS;
+          if (p1Pending) {
+            targetAt = Math.max(targetAt, resolutionStartedAt + PRIORITY_WAIT_MS);
+            targetAt = Math.min(targetAt, resolutionStartedAt + HARD_DEADLINE_MS);
+          } else {
+            targetAt = Math.min(targetAt, resolutionStartedAt + SOFT_DEADLINE_MS);
           }
         }
-      }
+        if (now >= targetAt) return finish();
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(evaluate, targetAt - now);
+      };
+      notify = evaluate;
+      evaluate();
+    });
+
+    for (const f of inFlight) {
+      if (f.settled && Array.isArray(f.value)) streams.push(...f.value);
     }
-    lateCount = inFlight.filter(f => !f.settled).length;
-  } else if (lateCount > 0) {
-    console.log(`[streams.js] Early return for ${matchId}: ${lateCount} source(s) still resolving (will be cached)`);
+    const lateCount = inFlight.filter((f) => !f.settled).length;
+    if (lateCount > 0) {
+      console.log(`[streams.js] Returned ${streams.length} stream(s) for ${matchId} after ${Date.now() - resolutionStartedAt}ms; ${lateCount} source(s) still resolving (will be cached)`);
+    }
   }
   // Withhold per-team 24/7 channels until the fixture is actually in its
   // playable window (see suppressPreMatchTeamChannels). Applied to the assembled

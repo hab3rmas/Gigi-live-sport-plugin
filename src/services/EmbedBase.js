@@ -50,6 +50,10 @@ function isUnreachableHost(host) {
   if (m172) { const n = Number(m172[1]); if (n >= 16 && n <= 31) return true; }
   const m100 = h.match(/^100\.(\d{1,3})\./);
   if (m100) { const n = Number(m100[1]); if (n >= 64 && n <= 127) return true; }
+  // RFC 5737 documentation / TEST-NET ranges and RFC 2544 benchmarking: never
+  // publicly routable, but some container/VPS networks hand them out.
+  if (/^192\.0\.2\./.test(h) || /^198\.51\.100\./.test(h) || /^203\.0\.113\./.test(h)) return true;
+  if (/^198\.1[89]\./.test(h)) return true;
 
   return false;
 }

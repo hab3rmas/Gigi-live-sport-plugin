@@ -3,7 +3,7 @@ const MatchEntity = require('../domain/MatchEntity');
 const StreamEntity = require('../domain/StreamEntity');
 const { BASE_URL } = require('../config');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile } = require('../services/childProcessLimiter');
 const { extractTeamsFromTitle } = require('../services/TeamNameExtractor');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';

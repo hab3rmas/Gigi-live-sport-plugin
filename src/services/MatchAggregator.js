@@ -786,8 +786,24 @@ class MatchAggregator {
 
   async _fetchProviderMatches(provider) {
     const startedAt = Date.now();
+    // Hard per-provider deadline. Without it a single upstream that never
+    // answers (several providers have no circuit breaker) kept the whole
+    // allSettled pending forever, leaving CronService.syncing === true and the
+    // catalog frozen until a restart.
+    const deadlineMs = Math.max(5000, Number(process.env.PROVIDER_SYNC_TIMEOUT_MS) || 90000);
+    let timer;
     try {
-      const matches = await provider.getMatches();
+      const matches = await Promise.race([
+        Promise.resolve().then(() => provider.getMatches()),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const err = new Error(`provider ${(provider && provider.name) || '?'} sync exceeded ${deadlineMs}ms`);
+            err.code = 'PROVIDER_SYNC_TIMEOUT';
+            reject(err);
+          }, deadlineMs);
+          if (timer.unref) timer.unref();
+        }),
+      ]).finally(() => clearTimeout(timer));
       if (this.providerHealthService) {
         this.providerHealthService.recordResult(provider, {
           matches,
@@ -807,7 +823,36 @@ class MatchAggregator {
     }
   }
 
-  async syncMatches() {
+  /**
+   * Single-flight entry point. Request paths (catalog replay rows, replay hubs)
+   * used to call syncMatches() directly whenever a sport had no replays, which
+   * in the off-season meant every catalog hit launched another full fan-out to
+   * every provider, in parallel. All callers now share one in-flight sync, and
+   * a just-finished sync is reused for a short window instead of re-running.
+   */
+  syncMatches() {
+    if (this._syncInFlight) return this._syncInFlight;
+    const reuseMs = Number(process.env.SYNC_REUSE_MS) || 0;
+    if (reuseMs > 0 && this._lastSyncResult && Date.now() - this._lastSyncAt < reuseMs) {
+      return Promise.resolve(this._lastSyncResult);
+    }
+    const p = Promise.resolve()
+      .then(() => this._syncMatchesImpl())
+      .then((result) => {
+        this._lastSyncAt = Date.now();
+        this._lastSyncResult = result;
+        return result;
+      })
+      .finally(() => {
+        if (this._syncInFlight === p) this._syncInFlight = null;
+      });
+    this._syncInFlight = p;
+    return p;
+  }
+
+  get isSyncInFlight() { return !!this._syncInFlight; }
+
+  async _syncMatchesImpl() {
     console.log('[MatchAggregator] Fetching from all providers...');
     if (this.providerHealthService) this.providerHealthService.startSync();
     const finalMatches = [];

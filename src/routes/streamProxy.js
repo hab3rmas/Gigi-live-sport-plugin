@@ -7,7 +7,28 @@
 const express = require('express');
 const http = require('http');
 const https = require('https');
+const { pipeline } = require('stream');
 const { checkOutboundUrl, rejectBlockedUrl } = require('../services/OutboundUrlGuard');
+
+// Wait for 'drain' OR for the client to go away. Awaiting 'drain' alone hung
+// forever when the client disconnected mid-write, pinning the request closure
+// and up to concurrency x chunk bytes (6-12 MB) per abandoned viewer.
+function waitDrainOrClose(res) {
+  return new Promise((resolve) => {
+    if (res.destroyed || res.writableEnded) return resolve(false);
+    const done = (ok) => {
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      res.off('error', onClose);
+      resolve(ok);
+    };
+    const onDrain = () => done(true);
+    const onClose = () => done(false);
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onClose);
+  });
+}
 const router = express.Router();
 
 const hlsChunkHttpsAgent = new https.Agent({
@@ -192,7 +213,8 @@ router.get('/api/fastmp4', async (req, res) => {
       if (aborted) return;
       if (buf && buf.length) {
         if (!res.write(buf)) {
-          await new Promise(r => res.once('drain', r));
+          const drained = await waitDrainOrClose(res);
+          if (!drained) { aborted = true; try { ac.abort(); } catch (_) {} return; }
         }
       }
       // a short read means upstream had nothing more for this window
@@ -232,7 +254,23 @@ router.get('/api/mp4proxy', async (req, res) => {
       headers['Range'] = req.headers['range'];
     }
 
-    const upstream = await fetch(targetUrl, { headers, redirect: 'follow' });
+    // Abort the upstream download as soon as the viewer leaves (seek, close,
+    // switch stream). Before, the MP4 kept downloading into a paused pipe and
+    // the socket stayed open until the CDN gave up.
+    const ac = new AbortController();
+    const abortUpstream = () => { try { ac.abort(); } catch (_) {} };
+    // res 'close' fires on client abort and after a finished response; req
+    // 'close' is avoided on purpose (on Node 16+ it can fire once the request
+    // body is consumed, which would abort a healthy download).
+    res.on('close', abortUpstream);
+    const headersTimer = setTimeout(abortUpstream, 20000);
+
+    let upstream;
+    try {
+      upstream = await fetch(targetUrl, { headers, redirect: 'follow', signal: ac.signal });
+    } finally {
+      clearTimeout(headersTimer);
+    }
 
     res.status(upstream.status);
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -243,13 +281,19 @@ router.get('/api/mp4proxy', async (req, res) => {
 
     const { Readable } = require('stream');
     if (upstream.body) {
-      Readable.fromWeb(upstream.body).pipe(res);
+      pipeline(Readable.fromWeb(upstream.body), res, (err) => {
+        if (err && !(err.name === 'AbortError' || err.code === 'ERR_STREAM_PREMATURE_CLOSE' || /abort/i.test(String(err.message)))) {
+          console.error('[MP4Proxy] stream error:', err.message);
+        }
+        abortUpstream();
+      });
     } else {
       res.end();
     }
   } catch (e) {
+    if (e && (e.name === 'AbortError' || /abort/i.test(String(e.message)))) return;
     console.error('[MP4Proxy] Error:', e.message);
-    if (!res.headersSent) res.status(500).send('Proxy error');
+    if (!res.headersSent) res.status(502).send('Proxy error');
   }
 });
 
@@ -363,8 +407,16 @@ router.get('/api/hlschunk', async (req, res) => {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Content-Type', 'video/mp2t');
 
-      const uncloakStream = createSegmentUncloakStream();
-      upstreamRes.pipe(uncloakStream).pipe(res);
+      res.setHeader('Cache-Control', 'no-store');
+      // pipeline() instead of chained .pipe(): an upstream reset or a client
+      // abort used to emit an unhandled 'error' (surfacing as
+      // uncaughtException) and leave the other side of the chain open.
+      pipeline(upstreamRes, createSegmentUncloakStream(), res, (err) => {
+        if (err && !(err.code === 'ERR_STREAM_PREMATURE_CLOSE' || err.code === 'ECONNRESET' || /abort/i.test(String(err.message)))) {
+          console.error('[HLSChunk] stream error:', err.message);
+        }
+        if (!upstreamReq.destroyed) upstreamReq.destroy();
+      });
     });
 
     upstreamReq.on('timeout', () => {

@@ -28,7 +28,7 @@
 const BaseProvider = require('./BaseProvider');
 const StreamEntity = require('../domain/StreamEntity');
 const path = require('path');
-const { execFile } = require('child_process');
+const { execFile } = require('../services/childProcessLimiter');
 
 // 🔒
 // Domain flags: known CF-protected domains that must skip server-side scraping.

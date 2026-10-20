@@ -15,6 +15,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
+const compression = require('compression');
+const crypto = require('crypto');
 const { getRouter } = require('stremio-addon-sdk');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const child_process = require('child_process');
@@ -29,7 +31,7 @@ const container = require('./container');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
-const { RESOLVER_PORT, workerOffset } = require('./resolverManager');
+const { RESOLVER_PORT, workerOffset, shutdownResolver } = require('./resolverManager');
 
 // Removed global User-Agent fix because it causes ECONNRESET on Streamed.pk
 
@@ -39,8 +41,21 @@ process.on('unhandledRejection', (reason) => {
   if (reason && (reason.name === 'AbortError' || reason.__expected)) return;
   console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
 });
+// An uncaught exception leaves the process in an undefined state. The original
+// handler swallowed every one forever; a burst now triggers a clean restart
+// (Docker / pm2 bring the process back), while an isolated one is still logged
+// and tolerated so a single bad upstream reply cannot bounce the server.
+const _uncaughtTimes = [];
+const UNCAUGHT_EXIT_THRESHOLD = Number(process.env.UNCAUGHT_EXIT_THRESHOLD) || 5;
 process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+  const now = Date.now();
+  _uncaughtTimes.push(now);
+  while (_uncaughtTimes.length && now - _uncaughtTimes[0] > 60000) _uncaughtTimes.shift();
+  if (_uncaughtTimes.length >= UNCAUGHT_EXIT_THRESHOLD) {
+    console.error(`[uncaughtException] ${_uncaughtTimes.length} within 60s - exiting so the supervisor restarts a clean process`);
+    setTimeout(() => process.exit(1), 200).unref();
+  }
 });
 
 // ─── Register Addon Handlers ──────────────────────────────────────────────────
@@ -54,7 +69,28 @@ builder.defineStreamHandler(({ type, id, config })         => handleStream(type,
 const app = express();
 
 app.set('trust proxy', true);
+app.disable('x-powered-by');
 app.use(cors());
+
+// gzip/brotli for JSON (catalog pages run 30-80 KB, replay hubs 2.5 MB+) and
+// playlists. Byte-streaming video proxies are excluded explicitly: compressing
+// MPEG-TS/MP4 wastes CPU and adds latency for no gain.
+const NO_COMPRESS_RE = /^\/api\/(?:fastmp4|mp4proxy|hlschunk|proxy-embed)\b/;
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => !NO_COMPRESS_RE.test(req.path) && compression.filter(req, res),
+}));
+
+// Static middleware used to run in front of EVERY request, so each
+// /catalog, /meta and /stream hit paid several fs.stat() calls across six
+// directories before reaching its handler. Addon/API routes now skip it.
+const ADDON_PATH_RE = /\/(?:catalog|meta|stream)\/|manifest\.json$/;
+function staticFor(mw) {
+  return (req, res, next) => {
+    if (req.path.startsWith('/api/') || ADDON_PATH_RE.test(req.path)) return next();
+    return mw(req, res, next);
+  };
+}
 
 // Artwork under /posters is large (the replay hero JPEGs are ~100-200 KB) and
 // rarely changes, but it used to be sent with no-store. That made Cloudflare
@@ -67,14 +103,14 @@ const posterStaticOptions = {
     res.setHeader('Cache-Control', 'public, max-age=2592000, stale-while-revalidate=604800');
   }
 };
-app.use('/posters', express.static(path.join(__dirname, '..', 'public', 'posters'), posterStaticOptions));
-app.use('/posters', express.static(path.join(__dirname, 'public', 'posters'), posterStaticOptions));
-app.use('/posters', express.static(path.join(__dirname, 'posters'), posterStaticOptions));
+app.use('/posters', staticFor(express.static(path.join(__dirname, '..', 'public', 'posters'), posterStaticOptions)));
+app.use('/posters', staticFor(express.static(path.join(__dirname, 'public', 'posters'), posterStaticOptions)));
+app.use('/posters', staticFor(express.static(path.join(__dirname, 'posters'), posterStaticOptions)));
 
 // Serve static assets from public (logos, cryptocurrency QR codes, etc.)
-app.use(express.static(path.join(__dirname, '..', 'public')));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.static(path.join(process.cwd(), 'public')));
+app.use(staticFor(express.static(path.join(__dirname, '..', 'public'))));
+app.use(staticFor(express.static(path.join(__dirname, 'public'))));
+app.use(staticFor(express.static(path.join(process.cwd(), 'public'))));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
@@ -790,24 +826,61 @@ app.get('/img', async (req, res) => {
 app.use(require('./routes/streamProxy'));
 app.use(require('./routes/manifest'));
 app.use(require('./routes/embed'));
-// Mount the HLS Video Proxy (routes to the internal resolver on port RESOLVER_PORT)
+// The resolver's shared resolve cache (/api/cache/*, /api/cache-stats) is an
+// internal L2 used over loopback by StreamResolveCache. It used to be reachable
+// from the internet through the /api proxy below, so anyone could POST fake
+// stream URLs into it (cache poisoning) or DELETE entries. Never proxy it.
+app.use(['/api/cache', '/api/cache-stats'], (req, res) => {
+  res.status(404).json({ error: 'not found' });
+});
+
+// Mount the HLS Video Proxy (routes to the internal resolver on port RESOLVER_PORT).
+// http-proxy-middleware v3+ ignores the legacy onError/logLevel options, so
+// the custom 502 handler never ran; it is wired through `on.error` now.
 app.use('/api', createProxyMiddleware({
   target: `http://127.0.0.1:${RESOLVER_PORT}/api`,
   changeOrigin: true,
   xfwd: true,
-  logLevel: 'debug',
-  onError: (err, req, res) => {
-    console.error('[Proxy Error] Failed to proxy /api request to internal resolver:', err.message);
-    if (!res.headersSent) {
-      res.status(502).send('Bad Gateway: Internal stream resolver is not responding.');
-    }
-  }
+  proxyTimeout: 30000,
+  timeout: 30000,
+  on: {
+    error: (err, req, res) => {
+      console.error('[Proxy Error] Failed to proxy /api request to internal resolver:', err.message);
+      try {
+        if (res && typeof res.status === 'function' && !res.headersSent) {
+          res.status(502).send('Bad Gateway: Internal stream resolver is not responding.');
+        } else if (res && typeof res.end === 'function') {
+          res.end();
+        } else if (res && typeof res.destroy === 'function') {
+          res.destroy();
+        }
+      } catch (_) {}
+    },
+  },
 }));
 
 // ─── Universal Dynamic Base URL Response Rewriter ─────────────────────────────
 // Intercepts /manifest.json, /catalog/*, /meta/*, and /stream/* responses to
 // dynamically rewrite all internal proxy URLs (/img, /watch, /api/manifest)
 // to match the client's incoming Host and Protocol.
+// Memo for the rewriter below: an unchanged body (memoized catalog page,
+// replay hub) for the same base URL is rewritten once, not JSON.parse'd and
+// re-stringified on every request. Keyed by base URL + body hash.
+const REWRITE_MEMO_MAX = 64;
+const REWRITE_MEMO_MIN_BYTES = 16 * 1024;
+const _rewriteMemo = new Map(); // key -> Buffer | null (null = nothing to rewrite)
+function rewriteMemoGet(key) {
+  if (!_rewriteMemo.has(key)) return undefined;
+  const v = _rewriteMemo.get(key);
+  _rewriteMemo.delete(key);
+  _rewriteMemo.set(key, v);
+  return v;
+}
+function rewriteMemoSet(key, value) {
+  _rewriteMemo.set(key, value);
+  while (_rewriteMemo.size > REWRITE_MEMO_MAX) _rewriteMemo.delete(_rewriteMemo.keys().next().value);
+}
+
 app.use((req, res, next) => {
   const isAddonRoute = req.path === '/manifest.json' || 
                        req.path.endsWith('/manifest.json') ||
@@ -836,6 +909,16 @@ app.use((req, res, next) => {
 
     if (chunks.length > 0) {
       const bodyBuffer = Buffer.concat(chunks);
+      let memoKey = null;
+      if (bodyBuffer.length >= REWRITE_MEMO_MIN_BYTES) {
+        memoKey = currentBaseUrl + '|' + crypto.createHash('sha1').update(bodyBuffer).digest('base64');
+        const memo = rewriteMemoGet(memoKey);
+        if (memo !== undefined) {
+          const out = memo || bodyBuffer;
+          res.setHeader('Content-Length', out.length);
+          return originalEnd.call(res, out, undefined, callback);
+        }
+      }
       const bodyString = bodyBuffer.toString('utf8');
 
       try {
@@ -896,9 +979,11 @@ app.use((req, res, next) => {
         if (modified) {
           const newBodyString = JSON.stringify(body);
           const newBuffer = Buffer.from(newBodyString, 'utf8');
+          if (memoKey) rewriteMemoSet(memoKey, newBuffer);
           res.setHeader('Content-Length', newBuffer.length);
-          return originalEnd.call(res, newBuffer, 'utf8', callback);
+          return originalEnd.call(res, newBuffer, undefined, callback);
         }
+        if (memoKey) rewriteMemoSet(memoKey, null);
       } catch (_) {
         // Not JSON or parse failure; fall through
       }
@@ -1152,7 +1237,7 @@ if (workerOffset === 0) {
 }
 
 const BIND_HOST = process.env.HOST || process.env.IP || '0.0.0.0';
-app.listen(PORT, BIND_HOST, () => {
+const server = app.listen(PORT, BIND_HOST, () => {
   console.log('');
   console.log('╔══════════════════════════════════════════════════════╗');
   console.log('║          🔴 Nuvio Live Sports Plugin                 ║');
@@ -1166,5 +1251,33 @@ app.listen(PORT, BIND_HOST, () => {
   console.log('');
 });
 
+// Keep player connections alive across playlist polls (players reload the
+// live playlist every few seconds; a fresh TCP/TLS handshake through the
+// reverse proxy each time is pure added latency). keepAliveTimeout must exceed
+// typical proxy idle timeouts, and headersTimeout must exceed keepAliveTimeout.
+server.keepAliveTimeout = Number(process.env.HTTP_KEEPALIVE_MS) || 65000;
+server.headersTimeout = server.keepAliveTimeout + 5000;
+server.requestTimeout = 0; // long-lived video responses must not be cut
 
-
+// Graceful shutdown: stop accepting, let in-flight requests finish (bounded),
+// then stop the resolver child. The original handler called process.exit(0)
+// immediately, cutting every active stream on each restart/deploy.
+let _shuttingDown = false;
+function gracefulShutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`[Server] ${signal} received - draining connections...`);
+  const force = setTimeout(() => {
+    console.log('[Server] Drain timeout reached, exiting.');
+    try { shutdownResolver(); } catch (_) {}
+    process.exit(0);
+  }, Number(process.env.SHUTDOWN_GRACE_MS) || 10000);
+  force.unref();
+  server.close(() => {
+    try { shutdownResolver(); } catch (_) {}
+    process.exit(0);
+  });
+  try { server.closeIdleConnections(); } catch (_) {}
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

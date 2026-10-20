@@ -78,6 +78,11 @@ class CacheService {
     const now = Date.now();
     if (this.lastStatCheck && (now - this.lastStatCheck < 1000)) return;
     this.lastStatCheck = now;
+    // Single-process deployments (Docker, pm2 fork mode) own the only writer:
+    // memory is authoritative once a snapshot exists, so the per-second
+    // stat() + synchronous re-read/parse/deep-clone of the whole cache on the
+    // request path is pure overhead. Multi-worker setups keep polling.
+    if (this._hasDiskSnapshot && !CacheService.isMultiProcess()) return;
     this._loadDiskCache();
   }
 
@@ -251,6 +256,15 @@ class CacheService {
   // the artwork included.
   bumpRev() {
     this.rev++;
+    // Tracked separately so consumers can tell "artwork improved" (serve the
+    // existing page, refresh in the background) from "the match set changed"
+    // (rebuild before answering).
+    this.logoRev = (this.logoRev || 0) + 1;
+  }
+
+  /** Revision of the match data itself, excluding artwork-only bumps. */
+  get dataRev() {
+    return this.rev - (this.logoRev || 0);
   }
 
   findMatch(matchId) {
@@ -324,5 +338,15 @@ class CacheService {
 }
 
 CacheService.CACHE_SCHEMA_VERSION = CACHE_SCHEMA_VERSION;
+
+// True when several processes may share the disk snapshot (pm2 cluster, or an
+// explicit CACHE_DISK_POLL=true). Jest workers keep the original polling
+// behaviour the suite was written against.
+CacheService.isMultiProcess = function isMultiProcess() {
+  if (process.env.CACHE_DISK_POLL === 'true') return true;
+  if (process.env.CACHE_DISK_POLL === 'false') return false;
+  if (process.env.JEST_WORKER_ID) return true;
+  return process.env.NODE_APP_INSTANCE !== undefined || process.env.exec_mode === 'cluster_mode';
+};
 
 module.exports = CacheService;
