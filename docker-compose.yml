@@ -17,6 +17,9 @@ services:
       - ADDON_URL=https://${DOMAIN}
     volumes:
       - ./data:/app/data       # match cache + logo cache survive restarts
+    dns:                       # Docker's embedded resolver intermittently returns EAI_AGAIN on some VPS
+      - 1.1.1.1
+      - 8.8.8.8
     expose:
       - "7000"
     stop_grace_period: 15s

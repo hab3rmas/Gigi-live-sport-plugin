@@ -3,8 +3,9 @@ FROM node:22-slim
 WORKDIR /app
 
 # psmisc provides `fuser`, used to clear a stale resolver port on restart.
+# fontconfig + fonts: without them generated posters (sharp/librsvg) have no usable text font.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends psmisc ca-certificates \
+ && apt-get install -y --no-install-recommends psmisc ca-certificates fontconfig fonts-dejavu-core fonts-liberation \
  && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
