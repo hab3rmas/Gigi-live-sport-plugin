@@ -13,6 +13,10 @@ import json, os, subprocess, sys, time, urllib.parse
 
 args = [a for a in sys.argv[1:] if not a.startswith('--')]
 base = 'http://127.0.0.1:7000'
+public = 'https://sports.drksha.com'
+if '--public' in sys.argv:
+    public = sys.argv[sys.argv.index('--public') + 1].rstrip('/')
+    args = [a for a in args if a != public]
 if '--base' in sys.argv:
     base = sys.argv[sys.argv.index('--base') + 1].rstrip('/')
     args = [a for a in args if a != base]
@@ -58,6 +62,7 @@ if not streams:
     sys.exit(1)
 
 good = 0
+laptop = []
 for i, s in enumerate(streams, 1):
     name = ((s.get('name') or '') + ' ' + (s.get('title') or '')).replace('\n', ' ')[:90]
     url = s['url']
@@ -80,11 +85,20 @@ for i, s in enumerate(streams, 1):
     segs = [l for l in txt.splitlines() if l and not l.startswith('#')][-3:]
     ok = 0
     for j, sg in enumerate(segs, 1):
-        _, c, size, t = curl(absolutize(cur, sg))
+        seg_url = absolutize(cur, sg)
+        _, c, size, t = curl(seg_url)
         kb = size / 1024
         print(f'    segment {j}: http {c}, {kb:.0f} KB, {t:.2f}s, {kb/t if t else 0:.0f} KB/s')
         ok += (c == 200 and size > 10000)
+        if j == len(segs) and c == 200 and size > 10000:
+            pub = public + seg_url[len(base):] if seg_url.startswith(base) else seg_url
+            laptop.append((i, name[:40], size, pub))
     verdict = 'OK' if segs and ok == len(segs) else 'BAD'
     good += verdict == 'OK'
     print('    =>', verdict)
+if laptop:
+    print('\n=== LAPTOP TEST: run on your laptop (shows real speed from this server to you) ===')
+    for i, nm, size, pub in laptop:
+        print(f'# [{i}] {nm}  (segment {size/1024:.0f} KB; needs ~{size/1024/1024/4:.1f}+ MB/s for 4s segments)')
+        print(f'curl -L -o /dev/null -w "[{i}] %{{speed_download}} B/s, %{{size_download}} B in %{{time_total}}s\\n" "{pub}"')
 print(f'\nsummary: {good}/{len(streams)} sources deliver segments from this server')
