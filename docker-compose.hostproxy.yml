@@ -1,0 +1,14 @@
+# Use when ports 80/443 are already taken by another reverse proxy on the host:
+# the bundled Caddy is not started and the addon is published on 127.0.0.1 only,
+# so your existing proxy (nginx / Caddy / Traefik) can forward the domain to it.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.hostproxy.yml up -d --build
+#   (add -f docker-compose.xray.yml to also join the xray network)
+#
+# NUVIO_HOST_PORT changes the local port (default 7000).
+services:
+  nuvio:
+    ports:
+      - "127.0.0.1:${NUVIO_HOST_PORT:-7000}:7000"
+  caddy:
+    profiles: ["bundled-caddy"]      # never started by default

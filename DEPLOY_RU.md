@@ -64,3 +64,38 @@ docker compose logs nuvio | grep outboundProxy    # должно быть: outbo
 ```
 Сменить страну выхода: поправить `outboundTag` в правиле для `nuvio-in` и перезапустить xray.
 Вернуть как было: убрать `OUTBOUND_PROXY_URL` из `.env` и запускать без `docker-compose.xray.yml`.
+
+## Если порты 80/443 уже заняты (другой сервис на сервере)
+Встроенный Caddy не запускаем, аддон слушает только `127.0.0.1:7000`, а домен направляет ваш существующий прокси.
+```bash
+docker compose down
+docker compose -f docker-compose.yml -f docker-compose.hostproxy.yml up -d --build
+curl -s http://127.0.0.1:7000/health
+```
+**Важно для видео:** в вашем прокси отключите буферизацию и поставьте большие таймауты, иначе трансляция будет подвисать.
+
+nginx:
+```nginx
+server {
+    server_name sports.example.com;           # ваш домен
+    # listen 443 ssl ... (сертификат как у остальных ваших сайтов)
+    location / {
+        proxy_pass http://127.0.0.1:7000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
+```
+Caddy (уже установленный):
+```
+sports.example.com {
+    reverse_proxy 127.0.0.1:7000 { flush_interval -1 }
+}
+```
+Если нужно закрыть служебные пути, как делает наш `deploy/Caddyfile`: `/api/cache*`, `/api/cache-stats`, `/api/matches` должны отвечать 404 снаружи.
