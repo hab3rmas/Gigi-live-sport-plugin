@@ -240,6 +240,31 @@ const SPEED_PROBE_RANGE_BYTES = Number(process.env.SPEED_PROBE_RANGE_BYTES || 52
 // cold click for a ranking signal only. Set ENABLE_SPEED_PROBE=true to restore.
 const ENABLE_SPEED_PROBE = process.env.ENABLE_SPEED_PROBE === 'true';
 
+// Direct (unwrapped) HLS links are fetched by the PLAYER itself, so the CDN sees the
+// viewer's IP, not the one that minted the token, and the player cannot send a Referer
+// reliably. With PROXY_ALL_STREAMS (default on) every direct .m3u8 whose referer is known
+// is wrapped in /api/manifest, so playlist and segments are fetched by this server (and
+// through OUTBOUND_PROXY_URL when set) and are also covered by the dead-link filter.
+const PROXY_ALL_STREAMS = process.env.PROXY_ALL_STREAMS !== 'false';
+
+function wrapDirectStream(s) {
+  if (!PROXY_ALL_STREAMS || !s || typeof s.url !== 'string') return s;
+  const url = s.url;
+  if (!/^https?:\/\//i.test(url) || !url.includes('.m3u8') || url.includes('/api/manifest') || url.includes('/watch?')) return s;
+  const hdrs = (s.behaviorHints && s.behaviorHints.proxyHeaders && s.behaviorHints.proxyHeaders.request) || {};
+  let referer = hdrs.Referer || hdrs.referer || '';
+  if (!referer && (s._source === 'cdnlive' || /^https?:\/\/cdnlivetv\.(tv|is)\//i.test(url))) referer = 'https://cdnlivetv.tv/';
+  if (!referer) return s;                              // unknown origin requirements: leave the link alone
+  let origin = hdrs.Origin || hdrs.origin || '';
+  if (!origin) { try { origin = new URL(referer).origin; } catch (_) { origin = ''; } }
+  s.url = `${BASE_URL}/api/manifest?url=${encodeURIComponent(url)}&referer=${encodeURIComponent(referer)}` + (origin ? `&origin=${encodeURIComponent(origin)}` : '');
+  if (s.behaviorHints) {
+    delete s.behaviorHints.proxyHeaders;
+    if (s.behaviorHints.notWebReady === true) delete s.behaviorHints.notWebReady;
+  }
+  return s;
+}
+
 // Proxied /api/manifest URLs wrap an upstream token that expires on its own
 // schedule. Tag the URL with the resolve-cache key that produced it so the
 // manifest proxy can evict that entry the moment upstream reports it dead,
@@ -496,8 +521,10 @@ async function verifyStreams(streams, cacheKey, m3u8Parser, resolveCache, opts =
       return null;
     }
 
+    wrapDirectStream(s);
+
     // We only pre-flight check direct live streams (m3u8 urls). Web player links or direct VODs are kept blindly.
-    if (s.url.includes('cdnlivetv.tv') || s.url.includes('/watch?') || s.url.includes('.mp4') || s.url.includes('pixeldrain.com') || s.url.includes('okcdn.ru') || s.url.includes('vkuser.net') || s.url.includes('mycdn.me') || s._source === 'hockeyreplays' || (s.behaviorHints && s.behaviorHints.notWebReady === false)) return s;
+    if ((s.url.includes('cdnlivetv.tv') && !s.url.includes('/api/manifest')) || s.url.includes('/watch?') || s.url.includes('.mp4') || s.url.includes('pixeldrain.com') || s.url.includes('okcdn.ru') || s.url.includes('vkuser.net') || s.url.includes('mycdn.me') || s._source === 'hockeyreplays' || (s.behaviorHints && s.behaviorHints.notWebReady === false)) return s;
 
     let targetUrl = s.url;
     let referer = '';
@@ -1540,6 +1567,7 @@ function suppressPreMatchTeamChannels(streams, match) {
 }
 
 module.exports = {
+  wrapDirectStream,
   handleStream,
   prewarmMatch,
   prewarmSkipProvidersSet,
