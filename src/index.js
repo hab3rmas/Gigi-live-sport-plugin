@@ -77,7 +77,7 @@ app.use(cors());
 // gzip/brotli for JSON (catalog pages run 30-80 KB, replay hubs 2.5 MB+) and
 // playlists. Byte-streaming video proxies are excluded explicitly: compressing
 // MPEG-TS/MP4 wastes CPU and adds latency for no gain.
-const NO_COMPRESS_RE = /^\/api\/(?:fastmp4|mp4proxy|hlschunk|proxy-embed)\b/;
+const NO_COMPRESS_RE = /^\/api\/(?:fastmp4|mp4proxy|hlschunk|speedtest|proxy-embed)\b/;
 app.use(compression({
   threshold: 1024,
   filter: (req, res) => !NO_COMPRESS_RE.test(req.path) && compression.filter(req, res),
@@ -833,6 +833,7 @@ app.get('/img', async (req, res) => {
 // ─── Shared safe HTTP client (impit + undici fallback) ───────────────────────
 // Works on Windows, Linux x64/ARM64, Alpine/musl. If impit native binary is
 // absent, all fetches silently use undici — streams continue to work.
+app.use(require('./routes/speedtest'));
 app.use(require('./routes/streamProxy'));
 app.use(require('./routes/manifest'));
 app.use(require('./routes/embed'));
